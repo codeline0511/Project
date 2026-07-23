@@ -1,0 +1,243 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+AppInclude(include/StaticUniformBuffers.glsl)
+AppInclude(ShadingRateClassification/include/Constants.glsl)
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE, local_size_z = 1) in;
+
+layout(binding = 0) restrict writeonly uniform uimage2D ImgResult;
+layout(binding = 1) restrict writeonly uniform image2D ImgDebug;
+layout(binding = 0) uniform sampler2D SamplerShaded;
+
+layout(std140, binding = 0) uniform SettingsUBO
+{
+    ENUM_DEBUG_MODE DebugMode;
+    float SpeedFactor;
+    float LumVarianceFactor;
+    float _Pad0;
+
+    vec2 MousePos;
+    int IsFoveated;
+    int VrsMode;
+
+    int UseMotionFusion;
+    int UseFrequencyMapFusion;
+    int FrequencyProtectLevel;
+    int _Pad1;
+} settingsUBO;
+
+layout(binding = 2) uniform usampler2D SamplerFrequencyMap;
+
+const int ENUM_VRS_MODE_ORIGINAL = 0;
+const int ENUM_VRS_MODE_FREQUENCY_MAP = 1;
+const int ENUM_VRS_MODE_DISTANCE = 2;
+
+uint GetFrequencyRate(uint frequencyRate);
+uint GetDistanceRate(float linearDepth);
+uint GetFrequencyRate(uint frequencyRate)
+{
+    if (frequencyRate == 0u) return ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV;
+    if (frequencyRate == 1u) return ENUM_SHADING_RATE_1_INVOCATION_PER_2X2_PIXELS_NV;
+    return ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV;
+}
+
+uint ApplyFrequencyProtection(uint currentRate, uint frequencyRate, int protectLevel)
+{
+    // protectLevel 0: 사용 안 함
+    // protectLevel 1: High detail만 1x1 보호
+    // protectLevel 2: High + Medium detail 보호
+
+    if (protectLevel <= 0)
+    {
+        return currentRate;
+    }
+
+    if (protectLevel == 1)
+    {
+        if (frequencyRate == 0u)
+        {
+            return min(currentRate, ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV);
+        }
+
+        return currentRate;
+    }
+
+    uint protectedRate = GetFrequencyRate(frequencyRate);
+
+    // shading rate index는 작을수록 고품질입니다.
+    // Frequency Map이 요구하는 품질보다 더 coarse해지지 않도록 제한합니다.
+    return min(currentRate, protectedRate);
+}
+
+uint GetDistanceRate(float linearDepth)
+{
+    if (linearDepth > 35.0) return ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV;
+    if (linearDepth > 10.0) return ENUM_SHADING_RATE_1_INVOCATION_PER_2X2_PIXELS_NV;
+    return ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV;
+}
+void GetTileData(vec3 color, vec2 velocity, out float speedSum, out float luminanceSum, out float luminanceSquaredSum);
+float GetLuminance(vec3 color);
+
+const uint SAMPLES_PER_TILE = TILE_SIZE * TILE_SIZE;
+
+shared float SharedSpeedSums[64];
+shared float SharedLumSums[64];
+shared float SharedLumSquaredSums[64];
+
+void main()
+{
+    ivec2 imgCoord = ivec2(gl_GlobalInvocationID.xy);
+    vec2 velocity = texelFetch(gBufferDataUBO.Velocity, imgCoord, 0).rg;
+    vec3 srcColor = texelFetch(SamplerShaded, imgCoord, 0).rgb;
+
+    float speedSum, luminanceSum, luminanceSquaredSum;
+    GetTileData(srcColor, velocity, speedSum, luminanceSum, luminanceSquaredSum);
+
+    if (gl_LocalInvocationIndex == 0)
+    {
+        float meanSpeed = speedSum / SAMPLES_PER_TILE;
+        meanSpeed /= perFrameDataUBO.DeltaRenderTime;
+
+        float luminanceMean = luminanceSum / SAMPLES_PER_TILE;
+        float luminanceSquaredMean = luminanceSquaredSum / SAMPLES_PER_TILE;
+
+        float variance = max(0.0, luminanceSquaredMean - luminanceMean * luminanceMean);
+        float stdDev = sqrt(variance);
+        float coeffOfVariation = (luminanceMean > 0.001) ? (stdDev / luminanceMean) : 0.0;
+
+        ivec2 tileCenter = ivec2(gl_WorkGroupID.xy * TILE_SIZE + (TILE_SIZE / 2));
+        float rawDepth = texelFetch(gBufferDataUBO.Depth, tileCenter, 0).r;
+        
+        float zNear = perFrameDataUBO.NearPlane;
+        float zFar = perFrameDataUBO.FarPlane;
+        float linearDepth = (zNear * zFar) / max(0.0001, zFar - rawDepth * (zFar - zNear));
+
+        uint originalEngineRate;
+        if (luminanceMean <= 0.001)
+        {
+            originalEngineRate = ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV;
+        }
+        else
+        {
+            float velocityShadingRate = mix(float(ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV), float(ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV), meanSpeed * settingsUBO.SpeedFactor);
+            float varianceShadingRate = mix(float(ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV), float(ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV), settingsUBO.LumVarianceFactor / coeffOfVariation);
+
+            float combinedShadingRate = velocityShadingRate + varianceShadingRate;
+            originalEngineRate = uint(clamp(round(combinedShadingRate), float(ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV), float(ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV)));
+        }
+
+        uint finalRateValue = originalEngineRate;
+        uint frequencyRate = texelFetch(SamplerFrequencyMap, ivec2(gl_WorkGroupID.xy), 0).r;
+
+        if (settingsUBO.VrsMode == ENUM_VRS_MODE_FREQUENCY_MAP)
+        {
+            finalRateValue = GetFrequencyRate(frequencyRate);
+        }
+        else if (settingsUBO.VrsMode == ENUM_VRS_MODE_DISTANCE)
+        {
+            finalRateValue = GetDistanceRate(linearDepth);
+        }
+        else
+        {
+            // Original 모드에서는 Lighting 기반 결과를 유지
+            finalRateValue = originalEngineRate;
+        }
+
+        // 모션블러 VRS는 모든 모드 이후에 적용
+        if (settingsUBO.UseMotionFusion == 1 && settingsUBO.VrsMode == ENUM_VRS_MODE_ORIGINAL)
+        {
+            float tileSpeed = speedSum / SAMPLES_PER_TILE;
+            if (tileSpeed > 0.001)
+            {
+                finalRateValue = min(finalRateValue + 1u,
+                    ENUM_SHADING_RATE_1_INVOCATION_PER_4X4_PIXELS_NV);
+            }
+        }
+
+        if (settingsUBO.UseFrequencyMapFusion == 1 && settingsUBO.VrsMode == ENUM_VRS_MODE_ORIGINAL)
+        {
+            finalRateValue = ApplyFrequencyProtection(
+            finalRateValue,
+            frequencyRate,
+            settingsUBO.FrequencyProtectLevel
+            );
+        }
+
+        if (settingsUBO.IsFoveated == 1)
+        {
+            vec2 normalizedPos = vec2(gl_WorkGroupID.xy) / vec2(gl_NumWorkGroups.xy);
+            vec2 res = textureSize(SamplerShaded, 0);
+            float aspect = res.x / res.y;
+            vec2 diff = normalizedPos - settingsUBO.MousePos;
+            diff.x *= aspect;
+            float dist = length(diff);
+
+            if (dist < 0.22) {
+                finalRateValue = ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV;
+            } else if (dist < 0.38) {
+                finalRateValue = min(finalRateValue, ENUM_SHADING_RATE_1_INVOCATION_PER_2X2_PIXELS_NV);
+            }
+        }
+        else if (settingsUBO.IsFoveated == 2)
+        {
+            vec2 normalizedPos = vec2(gl_WorkGroupID.xy) / vec2(gl_NumWorkGroups.xy);
+            vec2 diff = normalizedPos - vec2(0.5, 0.5);
+            vec2 res = textureSize(SamplerShaded, 0);
+            float aspect = res.x / res.y;
+            diff.x *= aspect;
+
+            float circularDist = length(diff);
+
+            if (circularDist < 0.45) {
+                finalRateValue = ENUM_SHADING_RATE_1_INVOCATION_PER_PIXEL_NV;
+            } else {
+                finalRateValue = min(finalRateValue, ENUM_SHADING_RATE_1_INVOCATION_PER_2X2_PIXELS_NV);
+            }
+        }
+        imageStore(ImgResult, ivec2(gl_WorkGroupID.xy), uvec4(finalRateValue));
+
+        if (settingsUBO.DebugMode == ENUM_DEBUG_MODE_SPEED)
+            imageStore(ImgDebug, ivec2(gl_WorkGroupID.xy), vec4(meanSpeed));
+        else if (settingsUBO.DebugMode == ENUM_DEBUG_MODE_LUMINANCE)
+            imageStore(ImgDebug, ivec2(gl_WorkGroupID.xy), vec4(luminanceMean));
+        else if (settingsUBO.DebugMode == ENUM_DEBUG_MODE_LUMINANCE_VARIANCE)
+            imageStore(ImgDebug, ivec2(gl_WorkGroupID.xy), vec4(coeffOfVariation));
+        else if (settingsUBO.DebugMode == ENUM_DEBUG_MODE_FREQUENCY_MAP)
+            imageStore(ImgDebug, ivec2(gl_WorkGroupID.xy), vec4(float(frequencyRate) / 2.0));
+    }
+}
+
+void GetTileData(vec3 color, vec2 velocity, out float speedSum, out float luminanceSum, out float luminanceSquaredSum)
+{
+    float luminance = GetLuminance(color);
+    float subgroupAddedSpeed = subgroupAdd(length(velocity));
+    float subgroupAddedLum = subgroupAdd(luminance);
+    float subgroupAddedSquaredLum = subgroupAdd(luminance * luminance);
+    if (subgroupElect())
+    {
+        SharedSpeedSums[gl_SubgroupID] = subgroupAddedSpeed;
+        SharedLumSums[gl_SubgroupID] = subgroupAddedLum;
+        SharedLumSquaredSums[gl_SubgroupID] = subgroupAddedSquaredLum;
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0)
+    {
+        for (int i = 1; i < gl_NumSubgroups; i++)
+        {
+            SharedSpeedSums[0] += SharedSpeedSums[i];
+            SharedLumSums[0] += SharedLumSums[i];
+            SharedLumSquaredSums[0] += SharedLumSquaredSums[i];
+        }
+    }
+    barrier();
+    speedSum = SharedSpeedSums[0];
+    luminanceSum = SharedLumSums[0];
+    luminanceSquaredSum = SharedLumSquaredSums[0];
+}
+
+float GetLuminance(vec3 color)
+{
+    return (color.x + color.y + color.z) * (1.0 / 3.0);
+}
+
